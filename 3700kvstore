@@ -1,20 +1,298 @@
 #!/usr/bin/env python3
 
-import argparse, socket, time, json, select, struct, sys, math, os
+import argparse, socket, time, json, select, struct, sys, math, os, random, uuid
+from json import JSONEncoder
 
 BROADCAST = "FFFF"
+
+
+def generate_MID():
+    return uuid.uuid4().hex
+
+
+class OutboundMessage:
+
+    def __init__(self, source, destination, leader, _type, mid, key=None,
+                 value=None, term=None, vote=None, lastLogInd=None):
+        self.source = source
+        self.destination = destination
+        self.leader = leader
+        self.type = _type
+        self.mid = mid
+        self.key = key
+        self.value = value
+        self.term = term
+        self.vote = vote
+        self.lastLogInd = lastLogInd
+
+    def __dict__(self):
+        return {
+            'src': self.source,
+            'dst': self.destination,
+            'leader': self.leader,
+            'type': self.type,
+            'MID': self.mid,
+            'key': self.key,
+            'value': self.value,
+            'term': self.term,
+            'vote': self.vote,
+            'lastLogInd': self.lastLogInd
+        }
+
+    def filtered_dict(self):
+        dictionary = self.__dict__()
+        return {key: value for key, value in dictionary.items() if value is not None}
+
+
+# Class for messages received and thus decoded,
+# converts entries in dict to fields in class.
+class InboundMessage:
+    def __init__(self, dictionary):
+        for key, value in dictionary.items():
+            setattr(self, key, value)
+
+
+# State superclass that applies to
+# all replicas, no matter the type they happen
+# to be in this term.
+class State:
+
+    def set_replica(self, replica):
+        self.replica = replica
+
+    def on_message(self, message):
+        # When a message is received, this method
+        # is called as a dispatcher for the respective message type
+        message = InboundMessage(json.loads(message))
+
+        type = message.type
+
+        if type == 'get' or type == 'put':
+            return self.on_external_command(message)
+        else:
+            # print("Received message '%s'" % (message.__dict__,), flush=True)
+            if message.term > self.replica.currentTerm:
+                # The term is further along, update accordingly
+                self.replica.currentTerm = message.term
+            elif message.term < self.replica.currentTerm:
+                # The replica we got this from is behind,
+                # let them know
+                # TODO: implement
+                #self.send_response_message(message.__dict__)
+                return self, None
+
+            if type == 'AppendEntries':
+                print("got heartbeat")
+                return self.on_append(message)
+            elif type == 'election':
+                print("got election message", message.__dict__)
+                return self.on_vote(message)
+            elif type == 'vote':
+                return self.on_vote_response(message)
+            elif type == 'response':
+                return self.on_response(message)
+
+    # def on_timeout(self, message):
+    #     # Called when leader has taken too long to send message or heartbeat
+    #     # thus timeout has been exceeded
+    #
+    # def on_external_command(self, message):
+    #     # Called when a command from a client has been received
+    #
+    # def on_append(self, message):
+    #     # Called when a leader wants to append an entry to the log
+    #
+    def on_vote(self, message):
+        """called when election start is received. """
+
+    #
+    # def on_vote_response(self, message):
+    #     # called when a vote is received for replica
+    #
+    # def on_response(self, message):
+    #     # called when a response is sent back to leader
+
+    def new_timeout(self):
+        # Updates timeout
+        self.currentTime = time.time()
+        return self.currentTime + random.uniform(0.15, 0.31)
+
+    def send_response_message(self, message):
+        # print("sending response" + str(message))
+        self.replica.send(message)
+
+
+# Voter superclass for followers and candidates
+class Voter(State):
+    def __init__(self):
+        self.prevVote = None
+
+
+# Follower class, all replicas are instantiated as such.
+class Follower(State):
+
+    def __init__(self):
+        self.prevVote = None
+        self.timeoutTime = self.new_timeout()
+
+    def on_external_command(self, message):
+        message = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'redirect', message.MID, )
+        self.send_response_message(message.filtered_dict())
+        return self, None
+
+    def on_vote(self, message):
+
+        if self.prevVote is None and message.lastLogInd >= self.replica.lastLogInd:
+            self.prevVote = message.src
+            self.send_vote_response(message)
+        else:
+            self.send_vote_response(message, yay=False)
+
+        return self, None
+
+    def send_vote_response(self, message, yay=True):
+        print("sending  vote")
+        response = OutboundMessage(self.replica.id, message.src, message.src, 'vote'
+                                   , message.MID, vote=yay, term=self.replica.currentTerm)
+        self.replica.leader = message.src
+        self.send_response_message(response.filtered_dict())
+        return self, None
+
+    def on_append(self, message):
+        self.timeoutTime = self.new_timeout()
+        return self, None
+
+
+# Leader class, replica becomes this when more than half the other
+# replicas vote for them
+class Leader(State):
+
+    def __init__(self):
+        self.nextIndexes = {}
+        self.matchIndex = {}
+
+    def set_replica(self, replica):
+        self.replica = replica
+        self.send_heartbeat()
+
+        for rep in self.replica.others:
+            self.nextIndexes[rep] = self.replica.lastLogInd + 1
+            self.matchIndex[rep] = 0
+
+    def on_response(self, message):
+        # check if appendentries worked for this rep
+        # if not message.vote:
+        # fail, roll log back for this follower
+        # self.nextIndexes[message.src] -= 1
+
+        # get next log entry to
+        return self, None
+
+    # We already won, we shouldn't listen to another
+    # replica asking for an election
+    def on_vote(self, message):
+        return self, None
+
+    # Already won, extra votes negligible
+    def on_vote_response(self, message):
+        return self, None
+
+    def on_external_command(self, message):
+        # TODO: error handling
+        if message.type == 'get':
+            if message.key in self.replica.stateMachine:
+                val = self.replica.stateMachine[message.key]
+                message = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'ok', message.MID,
+                                          value=val)
+            else:
+                message = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'ok', message.MID,
+                                          value="")
+        else:
+            self.replica.stateMachine[message.key] = message.value
+            message = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'ok', message.MID)
+
+        self.send_response_message(message.filtered_dict())
+        return self, None
+
+    def send_heartbeat(self):
+        print ("sending heartbeat")
+        for rep in self.replica.others:
+            message = OutboundMessage(self.replica.id, rep, self.replica.leader, 'AppendEntries', generate_MID()
+                                      , term=self.replica.currentTerm, lastLogInd=self.replica.lastLogInd)
+            self.replica.send(message.filtered_dict())
+        return self, None
+
+    #def on_append(self, message):
+
+
+
+# Candidate class, replicas go in this state if they timeout
+class Candidate(Voter):
+    def set_replica(self, replica):
+        self.replica = replica
+        self.votes = {}
+        self.initiate_election()
+
+    def on_vote(self, message):
+        return self, None
+
+    def on_vote_response(self, message):
+        if message.src not in self.votes:
+            self.votes[message.src] = message
+            if len(self.votes) > (self.replica.total_reps - 1) / 2:
+                print("I won")
+                leader = Leader()
+                self.replica.state = leader
+                leader.set_replica(self.replica)
+                self.replica.leader = self.replica.id
+
+                return leader, None
+        return self, None
+
+    def initiate_election(self):
+        print("starting election")
+        self.replica.currentTerm += 1
+        for rep in self.replica.others:
+            message = OutboundMessage(self.replica.id, rep, self.replica.id, 'election', generate_MID(),
+                                      term=self.replica.currentTerm, lastLogInd=self.replica.lastLogInd)
+            print("sending msg %s" % message.filtered_dict())
+            self.replica.send(message.filtered_dict())
+        self.prevVote = self.replica.id
+        return self, None
+
+    def on_external_command(self, message):
+        message = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'redirect', message.MID, )
+        self.send_response_message(message.filtered_dict())
+        return self, None
+
+    def on_append(self, message):
+        # if we get an append defer to this leader
+        follower = Follower()
+        self.replica.state = follower
+        follower.set_replica(self.replica)
+        self.replica.leader = message.src
+        self.replica.state.timeoutTime = self.new_timeout()
+        return self, None
 
 class Replica:
     def __init__(self, port, id, others):
         self.port = port
         self.id = id
         self.others = others
+        self.state = Follower()
+        self.currentTerm = 0
+        self.lastLogInd = 0
+        self.total_reps = 0
+        self.leader = BROADCAST
+        self.stateMachine = {}
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('localhost', 0))
 
+        self.state.set_replica(self)
+
         print("Replica %s starting up" % self.id, flush=True)
-        hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+        hello = {"src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello"}
         self.send(hello)
         print("Sent hello message: %s" % hello, flush=True)
 
@@ -23,10 +301,19 @@ class Replica:
 
     def run(self):
         while True:
+            if isinstance(self.state, Leader):
+                self.state.send_heartbeat()
             data, addr = self.socket.recvfrom(65535)
             msg = data.decode('utf-8')
 
-            print("Received message '%s'" % (msg,), flush=True)
+            # print("Received message '%s'" % (msg,), flush=True)
+            self.state.on_message(msg)
+            if (isinstance(self.state, Follower)
+                    and self.state.timeoutTime < time.time()):
+                self.state = Candidate()
+                self.state.set_replica(self)
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='run a key-value store')
