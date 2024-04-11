@@ -13,7 +13,8 @@ def generate_MID():
 class OutboundMessage:
 
     def __init__(self, source, destination, leader, _type, mid, key=None,
-                 value=None, term=None, vote=None, lastLogInd=None):
+                 value=None, term=None, vote=None, lastLogInd=None, lastLogTerm=None
+                 , entries=None):
         self.source = source
         self.destination = destination
         self.leader = leader
@@ -24,6 +25,8 @@ class OutboundMessage:
         self.term = term
         self.vote = vote
         self.lastLogInd = lastLogInd
+        self.lastLogTerm = lastLogTerm
+        self.entries = entries
 
     def __dict__(self):
         return {
@@ -178,6 +181,7 @@ class Leader(State):
         # if not message.vote:
         # fail, roll log back for this follower
         # self.nextIndexes[message.src] -= 1
+        ## TODO: implement and get commiting working.
 
         # get next log entry to
         return self, None
@@ -193,19 +197,21 @@ class Leader(State):
 
     def on_external_command(self, message):
         # TODO: error handling
-        if message.type == 'get':
-            if message.key in self.replica.stateMachine:
-                val = self.replica.stateMachine[message.key]
-                message = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'ok', message.MID,
-                                          value=val)
-            else:
-                message = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'ok', message.MID,
-                                          value="")
-        else:
-            self.replica.stateMachine[message.key] = message.value
-            message = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'ok', message.MID)
-
-        self.send_response_message(message.filtered_dict())
+        self.replica.log[self.replica.currentTerm] = message.type
+        self.send_append(message)
+        # if message.type == 'get':
+        #     if message.key in self.replica.stateMachine:
+        #         val = self.replica.stateMachine[message.key]
+        #         message = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'ok', message.MID,
+        #                                   value=val)
+        #     else:
+        #         message = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'ok', message.MID,
+        #                                   value="")
+        # else:
+        #     self.replica.stateMachine[message.key] = message.value
+        #     message = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'ok', message.MID)
+        #
+        # self.send_response_message(message.filtered_dict())
         return self, None
 
     def send_heartbeat(self):
@@ -216,7 +222,14 @@ class Leader(State):
             self.replica.send(message.filtered_dict())
         return self, None
 
-    # def on_append(self, message):
+    def send_append(self, message):
+        print("sending append")
+        for rep in self.replica.others:
+            message = OutboundMessage(self.replica.id, rep, self.replica.leader, 'AppendEntries', generate_MID()
+                                      , term=self.replica.currentTerm, lastLogInd=self.replica.lastLogInd, lastLogTerm=self.replica.lastLogTerm,
+                                      entries = self.replica.log)
+            self.replica.send(message.filtered_dict())
+        return self, None
 
 
 # Candidate class, replicas go in this state if they timeout
@@ -275,9 +288,11 @@ class Replica:
         self.state = Follower()
         self.currentTerm = 0
         self.lastLogInd = 0
+        self.lastLogTerm = None
         self.total_reps = 0
         self.leader = BROADCAST
         self.stateMachine = {}
+        self.log = {}
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('localhost', 0))
