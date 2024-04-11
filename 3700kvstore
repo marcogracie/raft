@@ -74,12 +74,6 @@ class State:
             if message.term > self.replica.currentTerm:
                 # The term is further along, update accordingly
                 self.replica.currentTerm = message.term
-            elif message.term < self.replica.currentTerm:
-                # The replica we got this from is behind,
-                # let them know
-                # TODO: implement
-                #self.send_response_message(message.__dict__)
-                return self, None
 
             if type == 'AppendEntries':
                 print("got heartbeat")
@@ -215,15 +209,14 @@ class Leader(State):
         return self, None
 
     def send_heartbeat(self):
-        print ("sending heartbeat")
+        print("sending heartbeat")
         for rep in self.replica.others:
             message = OutboundMessage(self.replica.id, rep, self.replica.leader, 'AppendEntries', generate_MID()
                                       , term=self.replica.currentTerm, lastLogInd=self.replica.lastLogInd)
             self.replica.send(message.filtered_dict())
         return self, None
 
-    #def on_append(self, message):
-
+    # def on_append(self, message):
 
 
 # Candidate class, replicas go in this state if they timeout
@@ -240,7 +233,6 @@ class Candidate(Voter):
         if message.src not in self.votes:
             self.votes[message.src] = message
             if len(self.votes) > (self.replica.total_reps - 1) / 2:
-                print("I won")
                 leader = Leader()
                 self.replica.state = leader
                 leader.set_replica(self.replica)
@@ -273,6 +265,7 @@ class Candidate(Voter):
         self.replica.leader = message.src
         self.replica.state.timeoutTime = self.new_timeout()
         return self, None
+
 
 class Replica:
     def __init__(self, port, id, others):
@@ -312,7 +305,6 @@ class Replica:
                     and self.state.timeoutTime < time.time()):
                 self.state = Candidate()
                 self.state.set_replica(self)
-
 
 
 if __name__ == "__main__":
