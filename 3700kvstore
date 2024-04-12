@@ -14,7 +14,7 @@ class OutboundMessage:
 
     def __init__(self, source, destination, leader, _type, mid, key=None,
                  value=None, term=None, vote=None, lastLogInd=None, lastLogTerm=None
-                 , entries=None):
+                 , entries=None, commitIndex=None):
         self.source = source
         self.destination = destination
         self.leader = leader
@@ -27,6 +27,7 @@ class OutboundMessage:
         self.lastLogInd = lastLogInd
         self.lastLogTerm = lastLogTerm
         self.entries = entries
+        self.commitIndex = commitIndex
 
     def __dict__(self):
         return {
@@ -39,7 +40,10 @@ class OutboundMessage:
             'value': self.value,
             'term': self.term,
             'vote': self.vote,
-            'lastLogInd': self.lastLogInd
+            'lastLogInd': self.lastLogInd,
+            'lastLogTerm': self.lastLogTerm,
+            'entries': self.entries,
+            'commitIndex': self.commitIndex
         }
 
     def filtered_dict(self):
@@ -125,6 +129,15 @@ class Voter(State):
         self.prevVote = None
 
 
+# helper function for slicing the log if conflicts found
+def slice_dict(log, prevLogInd):
+    sortedKeys = sorted(log.keys())
+    slicedKeys = sortedKeys[:prevLogInd]
+
+    newLog = {key: log[key] for key in slicedKeys}
+    return newLog
+
+
 # Follower class, all replicas are instantiated as such.
 class Follower(State):
 
@@ -157,7 +170,41 @@ class Follower(State):
 
     def on_append(self, message):
         self.timeoutTime = self.new_timeout()
-        return self, None
+
+        # If leader is behind, reply false
+        # 1 in recv impl condensed summary (5.1)
+        if message.term < self.replica.currentTerm:
+            response = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'response',
+                                       message.MID, vote=False, term=self.replica.currentTerm)
+            self.send_response_message(response.filtered_dict())
+            return self, None
+        # if not heartbeat
+        elif hasattr(message, 'entries'):
+            # Check if leader is further along
+            # 5 in recv impl condensed summary
+            if message.commitIndex > self.replica.commitIndex:
+                # if further, update commit index locally
+                self.replica.commitIndex = min(message.commitIndex, self.replica.lastLogInd)
+
+            # ensure term of prevlogindex locally is in sync with leader
+            # 2 in recv impl condensed summary
+            if self.replica.log[message.prevLogInd] != message.prevLogTerm:
+                # whoops, there's a conflict
+                # we have to send a false back
+                # first delete existing entry and all following it 3 in recv impl condensed summary (5.3)
+                self.replica.log = slice_dict(self.replica.log, message.prevLogInd)
+                response = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'response',
+                                           message.MID, vote=False, term=self.replica.currentTerm)
+                self.send_response_message(response.filtered_dict())
+                self.replica.lastLogInd = message.prevLogInd
+                self.replica.lastLogTerm = message.prevLogTerm
+                return self, None
+            else:
+                # no conflicts found
+
+
+
+
 
 
 # Leader class, replica becomes this when more than half the other
@@ -226,8 +273,9 @@ class Leader(State):
         print("sending append")
         for rep in self.replica.others:
             message = OutboundMessage(self.replica.id, rep, self.replica.leader, 'AppendEntries', generate_MID()
-                                      , term=self.replica.currentTerm, lastLogInd=self.replica.lastLogInd, lastLogTerm=self.replica.lastLogTerm,
-                                      entries = self.replica.log)
+                                      , term=self.replica.currentTerm, lastLogInd=self.replica.lastLogInd,
+                                      lastLogTerm=self.replica.lastLogTerm,
+                                      entries=self.replica.log, commitIndex=self.replica.commitIndex)
             self.replica.send(message.filtered_dict())
         return self, None
 
@@ -293,6 +341,7 @@ class Replica:
         self.leader = BROADCAST
         self.stateMachine = {}
         self.log = {}
+        self.commitIndex = 0
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('localhost', 0))
