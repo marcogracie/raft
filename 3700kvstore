@@ -83,10 +83,10 @@ class State:
                 self.replica.currentTerm = message.term
 
             if type == 'AppendEntries':
-                print("got heartbeat/ append")
+                # print("got heartbeat/ append")
                 return self.on_append(message)
             elif type == 'election':
-                print("got election message", message.__dict__)
+                # print("got election message", message.__dict__)
                 return self.on_vote(message)
             elif type == 'vote':
                 return self.on_vote_response(message)
@@ -116,7 +116,7 @@ class State:
     def new_timeout(self):
         # Updates timeout
         self.currentTime = time.time()
-        return self.currentTime + random.uniform(0.15, 0.31)
+        return self.currentTime + random.randrange(5, 10)
 
     def send_response_message(self, message):
         # print("sending response" + str(message))
@@ -161,10 +161,11 @@ class Follower(State):
         return self, None
 
     def send_vote_response(self, message, yay=True):
-        print("sending  vote")
+        # print("sending  vote")
         response = OutboundMessage(self.replica.id, message.src, message.src, 'vote'
                                    , message.MID, vote=yay, term=self.replica.currentTerm)
-        self.replica.leader = message.src
+        if yay:
+            self.replica.leader = message.src
         self.send_response_message(response.filtered_dict())
         return self, None
 
@@ -175,6 +176,7 @@ class Follower(State):
 
     def on_append(self, message):
         self.timeoutTime = self.new_timeout()
+        self.replica.leader = message.src
 
         # If leader is behind, reply false
         # 1 in recv impl condensed summary (5.1)
@@ -185,7 +187,7 @@ class Follower(State):
             return self, None
         # if not heartbeat
         elif hasattr(message, 'entries'):
-            print("legit append")
+            # print("legit append")
             # Check if leader is further along
             # 5 in recv impl condensed summary
             if message.commitIndex > self.replica.commitIndex:
@@ -249,32 +251,36 @@ class Leader(State):
         self.matchIndex = {}
         self.commits = {}
         self.message_to_confirm = {}
+        # to reduce numm of heartbeats, set short timer
+        self.timeout = 1
 
     def set_replica(self, replica):
         self.replica = replica
         self.send_heartbeat()
+        self.timer = time.time() + self.timeout
 
         for rep in self.replica.others:
             self.nextIndexes[rep] = self.replica.lastLogInd + 1
             self.matchIndex[rep] = 0
 
     def on_response(self, message):
-        print("checking response")
+        # print("checking response")
         if message.MID not in self.commits:
-            self.commits[message.MID] = [] #init commit list for this MID
+            self.commits[message.MID] = []  # init commit list for this MID
         if not message.vote:
-            print("failed")
+            # print("failed")
             # fail, roll log back for this follower
             self.nextIndexes[message.src] -= 1
 
             # retry append
-            message_retry = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'AppendEntries', message.MID
-                                      , term=self.replica.currentTerm, lastLogInd=self.replica.lastLogInd,
-                                      lastLogTerm=self.replica.lastLogTerm,
-                                      entries=self.replica.log, commitIndex=self.replica.commitIndex)
+            message_retry = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'AppendEntries',
+                                            message.MID
+                                            , term=self.replica.currentTerm, lastLogInd=self.replica.lastLogInd,
+                                            lastLogTerm=self.replica.lastLogTerm,
+                                            entries=self.replica.log, commitIndex=self.replica.commitIndex)
             self.replica.send(message_retry.filtered_dict())
         else:
-            #print("append successful on:" + message.src)
+            # print("append successful on:" + message.src)
             # the append went through, add a commit count and increase their index
             self.nextIndexes[message.src] += 1
             if message.src not in self.commits[message.MID]:
@@ -300,6 +306,9 @@ class Leader(State):
                                                   'ok',
                                                   message_to_confirm.MID)
             self.send_response_message(confirm_message.filtered_dict())
+            # remove so we don't send duplicates
+            self.commits.pop(message.MID)
+            return self, None
 
     # We already won, we shouldn't listen to another
     # replica asking for an election
@@ -308,6 +317,16 @@ class Leader(State):
 
     # Already won, extra votes negligible
     def on_vote_response(self, message):
+        return self, None
+
+    def on_append(self, message):
+        # if we get an append from a leader ahead of us,
+        # defer to them.
+        if message.term > self.replica.currentTerm:
+            follower = Follower()
+            self.replica.state = follower
+            follower.set_replica(self.replica)
+            self.replica.leader = message.src
         return self, None
 
     def on_external_command(self, message):
@@ -320,18 +339,20 @@ class Leader(State):
         return self, None
 
     def send_heartbeat(self):
-        print("sending heartbeat")
+        # print("sending heartbeat")
+        self.timer = time.time() + self.timeout
         for rep in self.replica.others:
-            message = OutboundMessage(self.replica.id, rep, self.replica.leader, 'AppendEntries', generate_MID()
+            message = OutboundMessage(self.replica.id, rep, self.replica.id, 'AppendEntries', generate_MID()
                                       , term=self.replica.currentTerm, lastLogInd=self.replica.lastLogInd)
             self.replica.send(message.filtered_dict())
         return self, None
 
     def send_append(self, message, mid):
-        print("sending append")
+        # print("sending append")
+        self.timer = time.time() + self.timeout
         self.replica.lastLogTerm = self.replica.log[self.replica.currentTerm]
         for rep in self.replica.others:
-            message = OutboundMessage(self.replica.id, rep, self.replica.leader, 'AppendEntries', mid
+            message = OutboundMessage(self.replica.id, rep, self.replica.id, 'AppendEntries', mid
                                       , term=self.replica.currentTerm, lastLogInd=self.replica.lastLogInd,
                                       lastLogTerm=self.replica.lastLogTerm,
                                       entries=self.replica.log, commitIndex=self.replica.commitIndex)
@@ -358,16 +379,14 @@ class Candidate(Voter):
                 leader.set_replica(self.replica)
                 self.replica.leader = self.replica.id
 
-                return leader, None
+                return self, None
         return self, None
 
     def initiate_election(self):
-        print("starting election")
         self.replica.currentTerm += 1
         for rep in self.replica.others:
             message = OutboundMessage(self.replica.id, rep, self.replica.id, 'election', generate_MID(),
                                       term=self.replica.currentTerm, lastLogInd=self.replica.lastLogInd)
-            print("sending msg %s" % message.filtered_dict())
             self.replica.send(message.filtered_dict())
         self.prevVote = self.replica.id
         return self, None
@@ -417,12 +436,12 @@ class Replica:
 
     def run(self):
         while True:
-            if isinstance(self.state, Leader):
+            if isinstance(self.state, Leader) and self.state.timer < time.time():
                 self.state.send_heartbeat()
             data, addr = self.socket.recvfrom(65535)
             msg = data.decode('utf-8')
 
-            # print("Received message '%s'" % (msg,), flush=True)
+            print("Received message '%s'" % (msg,), flush=True)
             self.state.on_message(msg)
             if (isinstance(self.state, Follower)
                     and self.state.timeoutTime < time.time()):
