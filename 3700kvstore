@@ -137,6 +137,14 @@ def slice_dict(log, prevLogInd):
     newLog = {key: log[key] for key in slicedKeys}
     return newLog
 
+# helper function for slicing the log for leader to send
+def slice_dict_other(log, prevLogInd):
+    sortedKeys = sorted(log.keys())
+    slicedKeys = sortedKeys[prevLogInd:]
+
+    newLog = {key: log[key] for key in slicedKeys}
+    return newLog
+
 
 # Follower class, all replicas are instantiated as such.
 class Follower(State):
@@ -177,6 +185,7 @@ class Follower(State):
     def on_append(self, message):
         self.timeoutTime = self.new_timeout()
         self.replica.leader = message.src
+        print(self.replica.log)
 
         # If leader is behind, reply false
         # 1 in recv impl condensed summary (5.1)
@@ -196,7 +205,7 @@ class Follower(State):
 
             # ensure term of prevlogindex locally is in sync with leader
             # 2 in recv impl condensed summary
-            if len(self.replica.log) > 0 and self.replica.log[message.lastLogInd] != message.lastLogTerm:
+            if len(self.replica.log) > 0 and self.replica.log[message.lastLogInd][0] != message.lastLogTerm:
                 # whoops, there's a conflict
                 # we have to send a false back
                 # first delete existing entry and all following it 3 in recv impl condensed summary (5.3)
@@ -210,25 +219,27 @@ class Follower(State):
             else:
                 # no conflicts found
                 # check if data at term is same as in message
-                if len(self.replica.log) > 0 and self.replica.log[message.commitIndex] != message.term:
+                if message.commitIndex in self.replica.log and self.replica.log[message.commitIndex] != message.term:
                     # data is diff, slice current log then set last val to commit val
                     self.replica.log = slice_dict(self.replica.log, self.replica.commitIndex)
+                    count = message.lastLogInd
                     for entry in message.entries:
-                        self.replica.log[self.replica.commitIndex] = entry
-                        self.replica.commitIndex += 1
+                        self.replica.log[count] = entry
+                        count += 1
                     # let leader know it's in our log
                     response = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'response',
                                                message.MID, vote=True, term=self.replica.currentTerm)
                     self.send_response_message(response.filtered_dict())
                     self.replica.lastLogInd = len(self.replica.log) - 1
                     self.replica.commitIndex = len(self.replica.log) - 1
-                    self.replica.lastLogTerm = self.replica.log[self.replica.commitIndex]
+                    self.replica.lastLogTerm = self.replica.currentTerm
                     return self, None
                 else:
                     # no conflicts, just put into log
+                    count = message.lastLogInd
                     for entry in message.entries:
-                        self.replica.log[self.replica.commitIndex] = entry
-                        self.replica.commitIndex += 1
+                        self.replica.log[count] = entry
+                        count += 1
                     # let leader know it's in our log
                     response = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'response',
                                                message.MID, vote=True, term=self.replica.currentTerm)
@@ -236,7 +247,7 @@ class Follower(State):
 
                     self.replica.lastLogInd = len(self.replica.log) - 1
                     self.replica.commitIndex = len(self.replica.log) - 1
-                    self.replica.lastLogTerm = self.replica.log[self.replica.commitIndex]
+                    self.replica.lastLogTerm = self.replica.currentTerm
                     return self, None
         else:
             return self, None
@@ -271,13 +282,14 @@ class Leader(State):
             # print("failed")
             # fail, roll log back for this follower
             self.nextIndexes[message.src] -= 1
+            log_to_send = slice_dict_other(self.replica.log, self.nextIndexes[message.src])
 
             # retry append
             message_retry = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'AppendEntries',
                                             message.MID
                                             , term=self.replica.currentTerm, lastLogInd=self.replica.lastLogInd,
                                             lastLogTerm=self.replica.lastLogTerm,
-                                            entries=self.replica.log, commitIndex=self.replica.commitIndex)
+                                            entries=log_to_send, commitIndex=self.replica.commitIndex)
             self.replica.send(message_retry.filtered_dict())
         else:
             # print("append successful on:" + message.src)
@@ -307,6 +319,8 @@ class Leader(State):
                                                   message_to_confirm.MID)
             self.send_response_message(confirm_message.filtered_dict())
             # remove so we don't send duplicates
+            # increment last log ind and set term
+            self.replica.commitIndex += 1
             self.commits.pop(message.MID)
             return self, None
 
@@ -330,8 +344,7 @@ class Leader(State):
         return self, None
 
     def on_external_command(self, message):
-        # TODO: error handling
-        self.replica.log[self.replica.currentTerm] = message.type
+        self.replica.log[self.replica.lastLogInd + 1] = self.replica.currentTerm, message.type
         self.send_append(message, message.MID)
         # store the message we will confirm send once we reach consensus
         self.message_to_confirm[message.MID] = message
@@ -350,13 +363,15 @@ class Leader(State):
     def send_append(self, message, mid):
         # print("sending append")
         self.timer = time.time() + self.timeout
-        self.replica.lastLogTerm = self.replica.log[self.replica.currentTerm]
+        self.replica.lastLogTerm = self.replica.currentTerm
+        log_to_send = slice_dict_other(self.replica.log, self.replica.lastLogInd)
         for rep in self.replica.others:
             message = OutboundMessage(self.replica.id, rep, self.replica.id, 'AppendEntries', mid
                                       , term=self.replica.currentTerm, lastLogInd=self.replica.lastLogInd,
                                       lastLogTerm=self.replica.lastLogTerm,
-                                      entries=self.replica.log, commitIndex=self.replica.commitIndex)
+                                      entries=log_to_send, commitIndex=self.replica.commitIndex)
             self.replica.send(message.filtered_dict())
+        self.replica.lastLogInd = len(log_to_send) - 1
         return self, None
 
 
@@ -441,7 +456,7 @@ class Replica:
             data, addr = self.socket.recvfrom(65535)
             msg = data.decode('utf-8')
 
-            print("Received message '%s'" % (msg,), flush=True)
+           # print("Received message '%s'" % (msg,), flush=True)
             self.state.on_message(msg)
             if (isinstance(self.state, Follower)
                     and self.state.timeoutTime < time.time()):
