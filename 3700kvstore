@@ -196,11 +196,8 @@ class Follower(State):
 
             # ensure term of prevlogindex locally is in sync with leader
             # 2 in recv impl condensed summary
-            if len(self.replica.log) > 0 and int(self.replica.log[message.lastLogInd][0]) != int(message.lastLogTerm):
-                print(self.replica.log)
-                print(self.replica.log[message.lastLogInd][0])
-                print(message.lastLogTerm)
-                print("conflict")
+            if len(self.replica.log) > 0 and int(self.replica.log[message.lastLogInd]['term']) != int(
+                    message.lastLogTerm):
                 # whoops, there's a conflict
                 # we have to send a false back
                 # first delete existing entry and all following it 3 in recv impl condensed summary (5.3)
@@ -213,7 +210,6 @@ class Follower(State):
             else:
                 # no conflicts found
                 # check if data at term is same as in message
-                print(self.replica.log)
                 # if len(self.replica.log) > 0 and self.replica.log[message.commitIndex][0] != message.term:
                 #     # data is diff, slice current log then set last val to commit val
                 #     self.replica.log = slice_dict(self.replica.log, self.replica.commitIndex)
@@ -228,9 +224,12 @@ class Follower(State):
                 #     self.replica.commitIndex = len(self.replica.log) - 1
                 #     self.replica.lastLogTerm = self.replica.currentTerm
                 # else:
-                    # no conflicts, just put into log
+                # no conflicts, just put into log
                 for k, v in message.entries.items():
                     self.replica.log[int(k)] = v
+                    if v['type'] == 'put':
+                        # if put, update statemachine
+                        self.replica.stateMachine[v['key']] = v['value']
                     self.replica.commitIndex += 1
                 # let leader know it's in our log
                 response = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'response',
@@ -255,17 +254,24 @@ class Leader(State):
         self.message_to_confirm = {}
         # to reduce num of heartbeats, set short timer
         self.timeout = 1
+        # keep track of reps we are waiting to hear from every 15 seconds
+        # so when one crashes we notice
+        self.res_timeout = 20
 
     def set_replica(self, replica):
         self.replica = replica
+        self.waiting_to_hear = []
         self.send_heartbeat()
         self.timer = time.time() + self.timeout
+        self.res_timer = time.time() + self.res_timeout
 
         for rep in self.replica.others:
             self.nextIndexes[rep] = self.replica.lastLogInd + 1
             self.matchIndex[rep] = 0
 
     def on_response(self, message):
+        if message.src not in self.waiting_to_hear:
+            self.waiting_to_hear.append(message.src)
         print("checking response")
         if message.MID not in self.commits:
             self.commits[message.MID] = []  # init commit list for this MID
@@ -284,7 +290,6 @@ class Leader(State):
                                             entries=log_to_send, commitIndex=self.matchIndex[message.src])
             self.send_response_message(message_retry.filtered_dict())
         else:
-            # print("append successful on:" + message.src)
             # the append went through, add a commit count and increase their index
             self.nextIndexes[message.src] += 1
             self.matchIndex[message.src] += 1
@@ -335,7 +340,11 @@ class Leader(State):
             self.replica.leader = message.src
 
     def on_external_command(self, message):
-        self.replica.log[self.replica.logInd] = self.replica.currentTerm, message.type
+        self.replica.log[self.replica.logInd] = {'term': self.replica.currentTerm, 'type': message.type,
+                                                 'key': message.key,
+                                                 'value': message.value} if message.type == 'put' else {
+            'term': self.replica.currentTerm, 'type': message.type,
+            'key': message.key}
         self.replica.logInd += 1
         self.send_append(message.MID)
         # store the message we will confirm send once we reach consensus
@@ -438,10 +447,15 @@ class Replica:
         while True:
             if isinstance(self.state, Leader) and self.state.timer < time.time():
                 self.state.send_heartbeat()
+            if isinstance(self.state, Leader) and self.state.res_timer < time.time():
+                self.others = self.state.waiting_to_hear
+                self.total_reps = len(self.others)
+                self.state.waiting_to_hear.clear()
+                self.state.res_timer = time.time() + self.state.res_timeout
             data, addr = self.socket.recvfrom(65535)
             msg = data.decode('utf-8')
 
-            print("Received message '%s'" % (msg,), flush=True)
+            # print("Received message '%s'" % (msg,), flush=True)
             self.state.on_message(msg)
             if (isinstance(self.state, Follower)
                     and self.state.timeoutTime < time.time()):
