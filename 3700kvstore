@@ -213,35 +213,35 @@ class Follower(State):
             else:
                 #no conflicts found
                 #check if data at term is same as in message
-                # if message.commitIndex in self.replica.log and self.replica.log[message.commitIndex]['term'] != message.term:
-                #     # data is diff, slice current log then set last val to commit val
-                #     self.replica.log = slice_dict(self.replica.log, self.replica.commitIndex)
-                #     for k, v in message.entries.items():
-                #         self.replica.log[int(k)] = v
-                #         self.replica.commitIndex += 1
-                #     # let leader know it's in our log
-                #     response = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'response',
-                #                                message.MID, vote=True, term=self.replica.currentTerm)
-                #     self.send_response_message(response.filtered_dict())
-                #     self.replica.lastLogInd = len(self.replica.log) - 1
-                #     self.replica.commitIndex = len(self.replica.log) - 1
-                #     self.replica.lastLogTerm = self.replica.currentTerm
-                # else:
-                # no conflicts, just put into log
-                for k, v in message.entries.items():
-                    self.replica.log[int(k)] = v
-                    if v['type'] == 'put':
-                        # if put, update statemachine
-                        print("adding" + v['key'] + v['value'], flush=True)
-                        self.replica.stateMachine[v['key']] = v['value']
-                    self.replica.commitIndex += 1
-                # let leader know it's in our log
-                response = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'response',
-                                           message.MID, vote=True, term=self.replica.currentTerm)
-                self.send_response_message(response.filtered_dict())
-                self.replica.lastLogInd = len(self.replica.log) - 1
-                self.replica.commitIndex = len(self.replica.log) - 1
-                self.replica.lastLogTerm = self.replica.currentTerm
+                if message.commitIndex in self.replica.log and self.replica.log[message.commitIndex]['term'] != message.term:
+                    # data is diff, slice current log then set last val to commit val
+                    self.replica.log = slice_dict(self.replica.log, self.replica.commitIndex)
+                    for k, v in message.entries.items():
+                        self.replica.log[int(k)] = v
+                        self.replica.commitIndex += 1
+                    # let leader know it's in our log
+                    response = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'response',
+                                               message.MID, vote=True, term=self.replica.currentTerm)
+                    self.send_response_message(response.filtered_dict())
+                    self.replica.lastLogInd = len(self.replica.log) - 1
+                    self.replica.commitIndex = len(self.replica.log) - 1
+                    self.replica.lastLogTerm = self.replica.currentTerm
+                else:
+                    # no conflicts, just put into log
+                    for k, v in message.entries.items():
+                        self.replica.log[int(k)] = v
+                        if v['type'] == 'put':
+                            # if put, update statemachine
+                            print("adding" + v['key'] + v['value'], flush=True)
+                            self.replica.stateMachine[v['key']] = v['value']
+                        self.replica.commitIndex += 1
+                    # let leader know it's in our log
+                    response = OutboundMessage(self.replica.id, message.src, self.replica.leader, 'response',
+                                               message.MID, vote=True, term=self.replica.currentTerm)
+                    self.send_response_message(response.filtered_dict())
+                    self.replica.lastLogInd = len(self.replica.log) - 1
+                    self.replica.commitIndex = len(self.replica.log) - 1
+                    self.replica.lastLogTerm = self.replica.currentTerm
 
         else:
             #ACK heartbeat:
@@ -387,6 +387,23 @@ class Leader(State):
         self.replica.lastLogInd = self.replica.logInd - 1 if self.replica.logInd > 0 else 0
         self.replica.lastLogTerm = self.replica.currentTerm
 
+    def check_uncommitted_entries(self):
+        for entry in self.commits:
+            for other in self.replica.others:
+                if other not in self.commits[entry]:
+                    log_to_send = slice_dict_other(self.replica.log, self.nextIndexes[other])
+                    index_to_send = max(0, self.nextIndexes[other] - 1)
+
+                    # retry append
+                    message_retry = OutboundMessage(self.replica.id, other, self.replica.leader, 'AppendEntries',
+                                                    entry
+                                                    , term=self.replica.currentTerm, lastLogInd=index_to_send,
+                                                    lastLogTerm=self.replica.lastLogTerm,
+                                                    entries=log_to_send, commitIndex=self.matchIndex[other],
+                                                    reps=len(self.waiting_to_hear))
+                    self.send_response_message(message_retry.filtered_dict())
+
+
 
 # Candidate class, replicas go in this state if they timeout
 class Candidate(Voter):
@@ -437,6 +454,7 @@ class Replica:
         self.currentTerm = 0
         self.lastLogInd = 0
         self.lastLogTerm = None
+        # total  reps
         self.total_reps = 5
         self.leader = BROADCAST
         self.stateMachine = {}
@@ -462,6 +480,7 @@ class Replica:
             if isinstance(self.state, Leader) and self.state.timer < time.time():
                 self.state.send_heartbeat()
             if isinstance(self.state, Leader) and self.state.res_timer < time.time():
+                self.state.check_uncommitted_entries()
                 self.total_reps = len(self.state.waiting_to_hear)
                 self.state.waiting_to_hear.clear()
                 self.state.res_timer = time.time() + self.state.res_timeout
